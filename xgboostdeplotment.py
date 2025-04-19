@@ -3,6 +3,15 @@ import pandas as pd
 import joblib
 import numpy as np
 from sklearn.preprocessing import LabelEncoder
+import streamlit as st
+import pandas as pd
+import joblib
+import numpy as np
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import DistanceMetric  # Add this import
+
+# Add this before loading your model to register the EuclideanDistance
+DistanceMetric.get_metric('euclidean')
 
 # Page configuration
 st.set_page_config(

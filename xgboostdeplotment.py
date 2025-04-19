@@ -3,64 +3,52 @@ import pandas as pd
 import joblib
 import numpy as np
 from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import DistanceMetric
+class EuclideanDistance:
+    def __init__(self, **kwargs):
+        pass
+    def pairwise(self, X, Y=None):
+        return DistanceMetric.get_metric('euclidean').pairwise(X, Y)
 
-# Custom loader to handle scikit-learn version differences
-def safe_load_model(path):
-    try:
-        # First try normal loading
-        return joblib.load(path)
-    except Exception as e:
-        st.warning(f"First load attempt failed: {str(e)}")
-        try:
-            # Try with custom encodings
-            import sklearn
-            sklearn.set_config(enable_metadata_routing=False)
-            model = joblib.load(path)
-            st.success("Loaded with compatibility settings")
-            return model
-        except Exception as e:
-            st.error(f"Final load failed: {str(e)}")
-            return None
+# Monkey patch the module
+import sklearn.metrics._dist_metrics
+sklearn.metrics._dist_metrics.EuclideanDistance = EuclideanDistance
 
 # Page configuration
 st.set_page_config(
-    page_title="NYC Property Predictor",
+    page_title="NYC Property Class Predictor",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
+# Cache the model and encoders loading
 @st.cache_resource
 def load_artifacts():
     try:
-        model = safe_load_model('finalGBDTmodel.joblib')
-        if model is None:
-            return None, None, None
-            
+        model = joblib.load('finalGBDTmodel.joblib')
         le_building = joblib.load('label_encoder_building.joblib')
         le_borough = joblib.load('label_encoder_borough.joblib')
-        
-        # Verify borough encoding matches our expected 1-5 scheme
-        test_values = ["Manhattan", "Brooklyn", "Queens", "Bronx", "Staten Island"]
-        encoded = le_borough.transform(test_values)
-        if not all(encoded == np.array([1, 2, 3, 4, 5])):
-            st.warning("Borough encoding doesn't match expected 1-5 scheme")
-        
         st.success("All artifacts loaded successfully!")
         return model, le_building, le_borough
-        
     except Exception as e:
-        st.error(f"Artifact loading failed: {str(e)}")
+        st.error(f"Loading failed: {str(e)}")
+        st.info("Please make sure these files exist in your directory:")
+        st.info("- finalGBDTmodel.joblib")
+        st.info("- label_encoder_building.joblib")
+        st.info("- label_encoder_borough.joblib")
         return None, None, None
 
 def main():
-    st.title("🏙️ NYC Property Class Predictor")
+    st.title("🏙️ NYC Property Class Predictor (XGBoost)")
+    st.markdown("Predict whether a property will be above or below median price")
     
+    # Load artifacts
     model, le_building, le_borough = load_artifacts()
     if None in [model, le_building, le_borough]:
         st.stop()
-
-    # Input form
-    with st.form("prediction_form"):
+    
+    # Input sidebar
+    with st.sidebar:
         st.header("Property Details")
         gross_sqft = st.number_input("GROSS SQUARE FEET", 500, 100000, 1500)
         land_sqft = st.number_input("LAND SQUARE FEET", 500, 100000, 2000)
@@ -72,39 +60,34 @@ def main():
             options=le_building.classes_
         )
         
-        borough_name = st.selectbox(
-            "BOROUGH",
+        borough = st.selectbox(
+            "BOROUGH 1=manhattan, 2=brooklyn, 3=queens, 4=bronx, 5=staten island",
             options=le_borough.classes_
         )
-        
-        submitted = st.form_submit_button("Predict Price Class")
     
-    if submitted:
-        with st.spinner('Processing prediction...'):
+    # Prepare input data with EXACT column names used in training
+    input_df = pd.DataFrame({
+        'GROSS SQUARE FEET': [gross_sqft],
+        'LAND SQUARE FEET': [land_sqft],
+        'YEAR BUILT': [year_built],
+        'RESIDENTIAL UNITS': [units],
+        'BUILDING CLASS CATEGORY': [building_class],
+        'BOROUGH': [borough]
+    }, index=[0])
+    
+    if st.button("Predict Price Class", type="primary"):
+        with st.spinner('Processing...'):
             try:
-                # Create input DataFrame with correct types
-                input_data = {
-                    'GROSS SQUARE FEET': float(gross_sqft),
-                    'LAND SQUARE FEET': float(land_sqft),
-                    'YEAR BUILT': int(year_built),
-                    'RESIDENTIAL UNITS': int(units),
-                    'BUILDING CLASS CATEGORY': str(building_class),
-                    'BOROUGH': str(borough_name)
-                }
-                
-                # Convert to DataFrame
-                input_df = pd.DataFrame([input_data])
-                
-                # Apply same transformations as training
+                # 1. Encode categorical variables exactly as in training
                 input_df['BUILDING_CLASS_ENCODED'] = le_building.transform(
-                    input_df['BUILDING CLASS CATEGORY']
+                    input_df['BUILDING CLASS CATEGORY'].astype(str)
                 )
                 input_df['BOROUGH_ENCODED'] = le_borough.transform(
-                    input_df['BOROUGH']
+                    input_df['BOROUGH'].astype(str)
                 )
                 
-                # Prepare final feature set
-                features = [
+                # 2. Select only the features used in training (after encoding)
+                features_for_prediction = [
                     'GROSS SQUARE FEET',
                     'LAND SQUARE FEET',
                     'YEAR BUILT',
@@ -112,41 +95,53 @@ def main():
                     'BUILDING_CLASS_ENCODED',
                     'BOROUGH_ENCODED'
                 ]
-                X = input_df[features]
+                X = input_df[features_for_prediction]
                 
-                # Make prediction
+                # 3. Make prediction (pipeline will handle imputation and SMOTE)
                 prediction = model.predict(X)
-                proba = model.predict_proba(X)[0] if hasattr(model, "predict_proba") else [0, 0]
+                proba = model.predict_proba(X)[0]
                 
                 # Display results
                 st.subheader("Prediction Result")
                 col1, col2 = st.columns(2)
+                
                 with col1:
                     st.metric("Predicted Class", 
-                            "High Price" if prediction[0] == 1 else "Low Price")
+                             "High Price" if prediction[0] == 1 else "Low Price")
+                
                 with col2:
                     st.metric("Confidence", 
-                             f"{max(proba)*100:.1f}%" if hasattr(model, "predict_proba") else "N/A")
+                             f"{max(proba)*100:.1f}%")
                 
-                # Show feature importance if available
-                if hasattr(model, 'feature_importances_'):
-                    try:
-                        st.subheader("Feature Importance")
-                        importance_df = pd.DataFrame({
-                            'Feature': features,
-                            'Importance': model.feature_importances_
-                        }).sort_values('Importance', ascending=False)
-                        st.bar_chart(importance_df.set_index('Feature'))
-                    except Exception as e:
-                        st.warning(f"Couldn't display feature importance: {str(e)}")
+                # Feature importance
+                st.subheader("Feature Importance")
+                xgb_model = model.named_steps['xgb']
+                importance = xgb_model.feature_importances_
+                
+                # Create readable feature names
+                feature_names = [
+                    'GROSS_SQ_FT',
+                    'LAND_SQ_FT',
+                    'YEAR_BUILT',
+                    'RESIDENTIAL_UNITS',
+                    'BUILDING_CLASS',
+                    'BOROUGH'
+                ]
+                
+                importance_df = pd.DataFrame({
+                    'Feature': feature_names,
+                    'Importance': importance
+                }).sort_values('Importance', ascending=False)
+                
+                st.bar_chart(importance_df.set_index('Feature'))
                 
             except Exception as e:
-                st.error(f"Prediction error: {str(e)}")
+                st.error(f"Prediction failed: {str(e)}")
                 st.info("""
-                Troubleshooting steps:
-                1. Verify all input values are valid
-                2. Check model files haven't been corrupted
-                3. Ensure you're using compatible Python packages
+                Common issues:
+                - Make sure all fields are filled
+                - Building class and borough must match training options
+                - Check the format of your input values
                 """)
 
 if __name__ == "__main__":

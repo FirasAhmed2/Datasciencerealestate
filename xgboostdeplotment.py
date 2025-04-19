@@ -3,52 +3,77 @@ import pandas as pd
 import joblib
 import numpy as np
 from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import DistanceMetric
-class EuclideanDistance:
-    def __init__(self, **kwargs):
-        pass
-    def pairwise(self, X, Y=None):
-        return DistanceMetric.get_metric('euclidean').pairwise(X, Y)
+import sys
+from importlib import reload
 
-# Monkey patch the module
-import sklearn.metrics._dist_metrics
-sklearn.metrics._dist_metrics.EuclideanDistance = EuclideanDistance
+# Fix for EuclideanDistance error in cloud environments
+def fix_sklearn_loading():
+    try:
+        import sklearn.metrics._dist_metrics
+        reload(sklearn.metrics._dist_metrics)
+        
+        # Create dummy EuclideanDistance class if needed
+        if not hasattr(sklearn.metrics._dist_metrics, 'EuclideanDistance'):
+            from sklearn.metrics import DistanceMetric
+            class EuclideanDistance:
+                def __init__(self, **kwargs):
+                    pass
+                def pairwise(self, X, Y=None):
+                    return DistanceMetric.get_metric('euclidean').pairwise(X, Y)
+            sklearn.metrics._dist_metrics.EuclideanDistance = EuclideanDistance
+    except Exception as e:
+        st.warning(f"Sklearn compatibility fix partially failed: {str(e)}")
+
+# Apply the fix before loading models
+fix_sklearn_loading()
 
 # Page configuration
 st.set_page_config(
-    page_title="NYC Property Class Predictor",
+    page_title="NYC Property Predictor",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# Cache the model and encoders loading
+# Enhanced model loader with multiple fallbacks
 @st.cache_resource
 def load_artifacts():
+    def try_loading(path):
+        try:
+            return joblib.load(path)
+        except Exception as e:
+            st.warning(f"Standard loading failed for {path}: {str(e)}")
+            try:
+                # Try with pickle directly
+                import pickle
+                with open(path, 'rb') as f:
+                    return pickle.load(f)
+            except Exception as e:
+                st.error(f"Alternative loading failed for {path}: {str(e)}")
+                return None
+
     try:
-        model = joblib.load('finalGBDTmodel.joblib')
-        le_building = joblib.load('label_encoder_building.joblib')
-        le_borough = joblib.load('label_encoder_borough.joblib')
+        model = try_loading('finalGBDTmodel.joblib')
+        le_building = try_loading('label_encoder_building.joblib')
+        le_borough = try_loading('label_encoder_borough.joblib')
+        
+        if None in [model, le_building, le_borough]:
+            return None, None, None
+            
         st.success("All artifacts loaded successfully!")
         return model, le_building, le_borough
+        
     except Exception as e:
-        st.error(f"Loading failed: {str(e)}")
-        st.info("Please make sure these files exist in your directory:")
-        st.info("- finalGBDTmodel.joblib")
-        st.info("- label_encoder_building.joblib")
-        st.info("- label_encoder_borough.joblib")
+        st.error(f"Artifact loading failed: {str(e)}")
         return None, None, None
 
 def main():
-    st.title("🏙️ NYC Property Class Predictor (XGBoost)")
-    st.markdown("Predict whether a property will be above or below median price")
+    st.title("🏙️ NYC Property Class Predictor")
     
-    # Load artifacts
     model, le_building, le_borough = load_artifacts()
     if None in [model, le_building, le_borough]:
         st.stop()
     
-    # Input sidebar
-    with st.sidebar:
+    with st.form("prediction_form"):
         st.header("Property Details")
         gross_sqft = st.number_input("GROSS SQUARE FEET", 500, 100000, 1500)
         land_sqft = st.number_input("LAND SQUARE FEET", 500, 100000, 2000)
@@ -60,88 +85,81 @@ def main():
             options=le_building.classes_
         )
         
-        borough = st.selectbox(
-            "BOROUGH 1=manhattan, 2=brooklyn, 3=queens, 4=bronx, 5=staten island",
+        borough_name = st.selectbox(
+            "BOROUGH",
             options=le_borough.classes_
         )
+        
+        submitted = st.form_submit_button("Predict Price Class")
     
-    # Prepare input data with EXACT column names used in training
-    input_df = pd.DataFrame({
-        'GROSS SQUARE FEET': [gross_sqft],
-        'LAND SQUARE FEET': [land_sqft],
-        'YEAR BUILT': [year_built],
-        'RESIDENTIAL UNITS': [units],
-        'BUILDING CLASS CATEGORY': [building_class],
-        'BOROUGH': [borough]
-    }, index=[0])
-    
-    if st.button("Predict Price Class", type="primary"):
-        with st.spinner('Processing...'):
+    if submitted:
+        with st.spinner('Processing prediction...'):
             try:
-                # 1. Encode categorical variables exactly as in training
+                # Prepare input data
+                input_df = pd.DataFrame({
+                    'GROSS SQUARE FEET': [float(gross_sqft)],
+                    'LAND SQUARE FEET': [float(land_sqft)],
+                    'YEAR BUILT': [int(year_built)],
+                    'RESIDENTIAL UNITS': [int(units)],
+                    'BUILDING CLASS CATEGORY': [str(building_class)],
+                    'BOROUGH': [str(borough_name)]
+                })
+                
+                # Apply transformations
                 input_df['BUILDING_CLASS_ENCODED'] = le_building.transform(
-                    input_df['BUILDING CLASS CATEGORY'].astype(str)
+                    input_df['BUILDING CLASS CATEGORY']
                 )
                 input_df['BOROUGH_ENCODED'] = le_borough.transform(
-                    input_df['BOROUGH'].astype(str)
+                    input_df['BOROUGH']
                 )
                 
-                # 2. Select only the features used in training (after encoding)
-                features_for_prediction = [
+                # Select final features
+                X = input_df[[
                     'GROSS SQUARE FEET',
                     'LAND SQUARE FEET',
                     'YEAR BUILT',
                     'RESIDENTIAL UNITS',
                     'BUILDING_CLASS_ENCODED',
                     'BOROUGH_ENCODED'
-                ]
-                X = input_df[features_for_prediction]
+                ]]
                 
-                # 3. Make prediction (pipeline will handle imputation and SMOTE)
+                # Make prediction
                 prediction = model.predict(X)
-                proba = model.predict_proba(X)[0]
                 
                 # Display results
                 st.subheader("Prediction Result")
-                col1, col2 = st.columns(2)
+                if hasattr(model, 'predict_proba'):
+                    proba = model.predict_proba(X)[0]
+                    confidence = f"{max(proba)*100:.1f}%"
+                else:
+                    confidence = "N/A"
                 
+                col1, col2 = st.columns(2)
                 with col1:
                     st.metric("Predicted Class", 
                              "High Price" if prediction[0] == 1 else "Low Price")
-                
                 with col2:
-                    st.metric("Confidence", 
-                             f"{max(proba)*100:.1f}%")
+                    st.metric("Confidence", confidence)
                 
                 # Feature importance
-                st.subheader("Feature Importance")
-                xgb_model = model.named_steps['xgb']
-                importance = xgb_model.feature_importances_
-                
-                # Create readable feature names
-                feature_names = [
-                    'GROSS_SQ_FT',
-                    'LAND_SQ_FT',
-                    'YEAR_BUILT',
-                    'RESIDENTIAL_UNITS',
-                    'BUILDING_CLASS',
-                    'BOROUGH'
-                ]
-                
-                importance_df = pd.DataFrame({
-                    'Feature': feature_names,
-                    'Importance': importance
-                }).sort_values('Importance', ascending=False)
-                
-                st.bar_chart(importance_df.set_index('Feature'))
+                if hasattr(model, 'feature_importances_'):
+                    try:
+                        st.subheader("Feature Importance")
+                        importance_df = pd.DataFrame({
+                            'Feature': X.columns,
+                            'Importance': model.feature_importances_
+                        }).sort_values('Importance', ascending=False)
+                        st.bar_chart(importance_df.set_index('Feature'))
+                    except Exception as e:
+                        st.warning(f"Couldn't display feature importance: {str(e)}")
                 
             except Exception as e:
-                st.error(f"Prediction failed: {str(e)}")
+                st.error(f"Prediction error: {str(e)}")
                 st.info("""
-                Common issues:
-                - Make sure all fields are filled
-                - Building class and borough must match training options
-                - Check the format of your input values
+                Troubleshooting:
+                1. Verify all inputs are valid
+                2. Check cloud logs for detailed errors
+                3. Ensure model files are properly uploaded
                 """)
 
 if __name__ == "__main__":
